@@ -9,10 +9,28 @@ use tokio::process::Command;
 const APP_ID: &str = "ru.sigmachan.KmsHdr";
 const BIN: &str = "/usr/local/bin/kms-hdr";
 const HDR_CAL: &str = "/usr/local/lib/kms-hdr/hdr-cal.py";
+const PID_FILE: &str = "/run/kms-hdr.pid";
+
+// ── PQ math (SMPTE ST 2084 forward EOTF) ──────────────────────────────────────
+
+/// Convert nits to PQ-encoded percentage (0–100%).
+/// Useful as a readout: ~58% PQ = 203 nits (BT.2408 SDR reference),
+/// ~75% PQ = 1000 nits, 100% PQ = 10 000 nits.
+fn nits_to_pq_percent(nits: u32) -> f64 {
+    const M1: f64 = 0.1593017578125;
+    const M2: f64 = 78.84375;
+    const C1: f64 = 0.8359375;
+    const C2: f64 = 18.8515625;
+    const C3: f64 = 18.6875;
+    let y = (nits as f64 / 10_000.0).clamp(0.0, 1.0);
+    let ym = y.powf(M1);
+    ((C1 + C2 * ym) / (1.0 + C3 * ym)).max(0.0).powf(M2) * 100.0
+}
 
 // ── Connector / EDID detection ─────────────────────────────────────────────────
 
-/// Returns (edid_path, sysfs_dir) for the first active connector with a valid EDID.
+/// Returns (edid_path, sysfs_dir) for the first active real connector with a valid EDID.
+/// Skips virtual connectors (X11 backend, winit-in-X, headless, Wayland backend).
 fn find_active_connector() -> Option<(String, String)> {
     let mut found: Vec<(String, String)> = std::fs::read_dir("/sys/class/drm")
         .ok()?
@@ -21,6 +39,21 @@ fn find_active_connector() -> Option<(String, String)> {
             let n = e.file_name();
             let s = n.to_string_lossy();
             if !s.starts_with("card") || !s.contains('-') { return None; }
+
+            // Extract connector part after "cardN-"
+            let connector = match s.find('-') {
+                Some(p) => &s[p + 1..],
+                None => return None,
+            };
+            // Skip virtual / headless connectors
+            if connector.starts_with("X11-")
+                || connector.starts_with("Virtual-")
+                || connector.starts_with("HEADLESS-")
+                || connector.starts_with("WL-")
+            {
+                return None;
+            }
+
             let edid = format!("/sys/class/drm/{}/edid", s);
             let ok = std::fs::read(&edid).map(|d| d.len() >= 128).unwrap_or(false);
             if ok { Some((edid, s.to_string())) } else { None }
@@ -28,6 +61,16 @@ fn find_active_connector() -> Option<(String, String)> {
         .collect();
     found.sort();
     found.into_iter().next()
+}
+
+// ── Daemon helpers ─────────────────────────────────────────────────────────────
+
+/// True if kms-hdr daemon is running (PID file exists and /proc/<pid> is alive).
+fn daemon_alive() -> bool {
+    std::fs::read_to_string(PID_FILE).ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+        .unwrap_or(false)
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -40,8 +83,9 @@ struct HdrConf {
     max_bpc: u32,
     gamut_mode: String,
     saturation: u32,
+    midtone_gamma: u32,   // 100=neutral, >100=HDR punch, <100=lift. Range 30–250.
     oled_preset: bool,
-    oled_dim_min: u32,   // auto-dim after N minutes (0 = off)
+    oled_dim_min: u32,
 }
 
 impl Default for HdrConf {
@@ -49,19 +93,19 @@ impl Default for HdrConf {
         Self {
             sdr_nits: 203, peak_nits: 800, gamut: 100, max_bpc: 10,
             gamut_mode: "bt2020".into(), saturation: 100,
-            oled_preset: false, oled_dim_min: 0,
+            midtone_gamma: 100, oled_preset: false, oled_dim_min: 0,
         }
     }
 }
 
-/// NVIDIA gaming features persisted to /etc/hdr-game.conf (read by hdr-game script)
+/// NVIDIA gaming features persisted to /etc/hdr-game.conf
 #[derive(Debug, Clone)]
 struct NvidiaConf {
     smooth_motion: bool,
     reflex: bool,
-    vibrance: i32,          // -1024..1023, 0 = neutral, 512 = vivid
-    upscale: String,        // "none" | "fsr" | "nis" | "dlss" | "integer"
-    dldsr: bool,            // Deep Learning Dynamic Super Resolution
+    vibrance: i32,
+    upscale: String,
+    dldsr: bool,
     gs_width: u32,
     gs_height: u32,
     gs_fps: u32,
@@ -70,14 +114,9 @@ struct NvidiaConf {
 impl Default for NvidiaConf {
     fn default() -> Self {
         Self {
-            smooth_motion: true,
-            reflex: true,
-            vibrance: 0,
-            upscale: "fsr".into(),
-            dldsr: false,
-            gs_width: 3840,
-            gs_height: 2160,
-            gs_fps: 120,
+            smooth_motion: true, reflex: true, vibrance: 0,
+            upscale: "fsr".into(), dldsr: false,
+            gs_width: 3840, gs_height: 2160, gs_fps: 120,
         }
     }
 }
@@ -87,10 +126,7 @@ fn is_nvidia() -> bool {
 }
 
 fn gpu_vendor() -> &'static str {
-    if std::path::Path::new("/dev/nvidia0").exists() {
-        return "nvidia";
-    }
-    // Check /sys/class/drm/card*/device/vendor — 0x1002 = AMD, 0x8086 = Intel
+    if std::path::Path::new("/dev/nvidia0").exists() { return "nvidia"; }
     if let Ok(rd) = std::fs::read_dir("/sys/class/drm") {
         for e in rd.flatten() {
             let n = e.file_name();
@@ -118,14 +154,15 @@ fn read_conf() -> HdrConf {
         for line in s.lines() {
             if let Some((k, v)) = line.split_once('=') {
                 match k.trim() {
-                    "SDR_NITS"   => { if let Ok(n) = v.trim().parse() { c.sdr_nits   = n; } }
-                    "PEAK_NITS"  => { if let Ok(n) = v.trim().parse() { c.peak_nits  = n; } }
-                    "GAMUT"      => { if let Ok(n) = v.trim().parse() { c.gamut      = n; } }
-                    "MAX_BPC"    => { if let Ok(n) = v.trim().parse() { c.max_bpc    = n; } }
-                    "GAMUT_MODE"  => { c.gamut_mode = v.trim().to_owned(); }
-                    "SATURATION"   => { if let Ok(n) = v.trim().parse() { c.saturation   = n; } }
-                    "OLED_PRESET"  => { c.oled_preset  = v.trim() == "1"; }
-                    "OLED_DIM_MIN" => { if let Ok(n) = v.trim().parse() { c.oled_dim_min = n; } }
+                    "SDR_NITS"      => { if let Ok(n) = v.trim().parse() { c.sdr_nits      = n; } }
+                    "PEAK_NITS"     => { if let Ok(n) = v.trim().parse() { c.peak_nits     = n; } }
+                    "GAMUT"         => { if let Ok(n) = v.trim().parse() { c.gamut         = n; } }
+                    "MAX_BPC"       => { if let Ok(n) = v.trim().parse() { c.max_bpc       = n; } }
+                    "GAMUT_MODE"    => { c.gamut_mode = v.trim().to_owned(); }
+                    "SATURATION"    => { if let Ok(n) = v.trim().parse() { c.saturation    = n; } }
+                    "MIDTONE_GAMMA" => { if let Ok(n) = v.trim().parse() { c.midtone_gamma = n; } }
+                    "OLED_PRESET"   => { c.oled_preset  = v.trim() == "1"; }
+                    "OLED_DIM_MIN"  => { if let Ok(n) = v.trim().parse() { c.oled_dim_min  = n; } }
                     _ => {}
                 }
             }
@@ -157,8 +194,20 @@ fn read_nvidia_conf() -> NvidiaConf {
     c
 }
 
+fn conf_args(c: &HdrConf) -> Vec<String> {
+    vec![
+        "--sdr-nits".into(),      c.sdr_nits.to_string(),
+        "--peak-nits".into(),     c.peak_nits.to_string(),
+        "--gamut".into(),         c.gamut.to_string(),
+        "--bpc".into(),           c.max_bpc.to_string(),
+        "--gamut-mode".into(),    c.gamut_mode.clone(),
+        "--saturation".into(),    c.saturation.to_string(),
+        "--midtone-gamma".into(), c.midtone_gamma.to_string(),
+        "--oled-dim-min".into(),  c.oled_dim_min.to_string(),
+    ]
+}
+
 async fn write_nvidia_conf(c: NvidiaConf) -> Result<(), String> {
-    // Use pkexec kms-hdr --save-game (polkit allow_active = yes, no password prompt)
     let status = Command::new("pkexec")
         .args([
             BIN, "--save-game",
@@ -172,26 +221,52 @@ async fn write_nvidia_conf(c: NvidiaConf) -> Result<(), String> {
             &format!("GS_FPS={}", c.gs_fps),
         ])
         .status().await.map_err(|e| e.to_string())?;
-    // Apply vibrance immediately via nvibrant if available
     if nvibrant_available() {
         let _ = Command::new("nvibrant").arg(c.vibrance.to_string()).status().await;
     }
     if status.success() { Ok(()) } else { Err(format!("kms-hdr --save-game exited {status}")) }
 }
 
+/// Write conf and apply HDR.
+/// If daemon is running: fast path — write conf only then send SIGUSR1 via --reload.
+/// Otherwise: one-shot apply with VT switch.
 async fn write_conf_and_apply(c: HdrConf) -> Result<(), String> {
+    let oled_dim = c.oled_dim_min;
+    let args = conf_args(&c);
+
+    if daemon_alive() {
+        // Fast path: write conf, signal daemon. Panel returns immediately.
+        let mut save_cmd = vec![BIN, "--save-only"];
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        save_cmd.extend_from_slice(&arg_refs);
+        let status = Command::new("pkexec")
+            .args(&save_cmd)
+            .status().await.map_err(|e| e.to_string())?;
+        if !status.success() { return Err(format!("kms-hdr --save-only exited {status}")); }
+
+        let reload = Command::new("pkexec")
+            .args([BIN, "--reload"])
+            .status().await.map_err(|e| e.to_string())?;
+        if !reload.success() {
+            // Daemon died between check and reload — fall through to direct apply
+            return direct_apply(args, oled_dim).await;
+        }
+        setup_oled_dim(oled_dim).await;
+        Ok(())
+    } else {
+        direct_apply(args, oled_dim).await
+    }
+}
+
+async fn direct_apply(args: Vec<String>, oled_dim: u32) -> Result<(), String> {
+    let mut cmd = vec![BIN, "--save"];
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    cmd.extend_from_slice(&arg_refs);
     let status = Command::new("pkexec")
-        .args([BIN, "--save",
-               "--sdr-nits",     &c.sdr_nits.to_string(),
-               "--peak-nits",    &c.peak_nits.to_string(),
-               "--gamut",        &c.gamut.to_string(),
-               "--bpc",          &c.max_bpc.to_string(),
-               "--gamut-mode",   &c.gamut_mode,
-               "--saturation",   &c.saturation.to_string(),
-               "--oled-dim-min", &c.oled_dim_min.to_string()])
+        .args(&cmd)
         .status().await.map_err(|e| e.to_string())?;
     if !status.success() { return Err(format!("kms-hdr exited {status}")); }
-    setup_oled_dim(c.oled_dim_min).await;
+    setup_oled_dim(oled_dim).await;
     Ok(())
 }
 
@@ -241,19 +316,19 @@ fn service_active() -> bool {
 #[derive(Debug, Default, Clone)]
 struct DisplayInfo {
     name: String,
-    connector_dir: String,    // sysfs entry, e.g. "card1-HDMI-A-2"
+    connector_dir: String,
     hdr10: bool,
     hlg: bool,
     hdr10plus: bool,
     dolby: bool,
     bt2020: bool,
-    dci_p3: bool,             // CTA-861 Colorimetry DCI-P3 bit
-    dsc: bool,                // Display Stream Compression (EDID + sysfs)
-    cec: bool,                // /dev/cec0 present
+    dci_p3: bool,
+    dsc: bool,
+    cec: bool,
     max_lum_nits: u32,
-    hdmi_ver: Option<String>, // "HDMI 1.4" / "HDMI 2.0" / "HDMI 2.1"
-    dp_ver: Option<String>,   // "DP 1.4" etc. (DP connectors only)
-    is_oled: bool,            // detected via EDID name or sysfs panel_type
+    hdmi_ver: Option<String>,
+    dp_ver: Option<String>,
+    is_oled: bool,
 }
 
 fn parse_edid() -> Option<DisplayInfo> {
@@ -261,7 +336,6 @@ fn parse_edid() -> Option<DisplayInfo> {
     let raw = std::fs::read(&edid_path).ok()?;
     let mut info = DisplayInfo { connector_dir: connector_dir.clone(), ..Default::default() };
 
-    // Monitor name from EDID descriptor tag 0xFC
     'desc: for i in (54..126usize).step_by(18) {
         if i + 17 >= raw.len() { break; }
         if raw[i..i+3] == [0x00, 0x00, 0x00] && raw[i+3] == 0xfc {
@@ -277,7 +351,6 @@ fn parse_edid() -> Option<DisplayInfo> {
             .unwrap_or_else(|| "Display".into());
     }
 
-    // CEA-861 extension blocks
     let mut bs = 128usize;
     while bs + 128 <= raw.len() {
         if raw[bs] != 0x02 { bs += 128; continue; }
@@ -290,11 +363,9 @@ fn parse_edid() -> Option<DisplayInfo> {
             let data = &raw[bs + i + 1 .. bs + i + 1 + length];
 
             match tag {
-                // Extended Data Block — data[0] is extended_tag
                 7 if !data.is_empty() => {
                     let payload = &data[1..];
                     match data[0] {
-                        // HDR Static Metadata (ext_tag=6)
                         6 if !payload.is_empty() => {
                             info.hdr10 = payload[0] & 0x04 != 0;
                             info.hlg   = payload[0] & 0x08 != 0;
@@ -303,16 +374,11 @@ fn parse_edid() -> Option<DisplayInfo> {
                                     (50.0 * 2f64.powf(payload[2] as f64 / 32.0)) as u32;
                             }
                         }
-                        // Colorimetry (ext_tag=5)
-                        // Byte 1 bits: 7=BT2020RGB 6=BT2020YCC 5=BT2020cYCC 4=opRGB
-                        //              3=opYCC601 2=sYCC601 1=DCI-P3 0=xvYCC709
                         5 if !payload.is_empty() => {
                             info.bt2020 = payload[0] & 0x80 != 0;
                             info.dci_p3 = payload[0] & 0x02 != 0;
                         }
-                        // HDR10+ (ext_tag=13)
                         13 => { info.hdr10plus = true; }
-                        // VSVDB (ext_tag=1): Dolby Vision — IEEE OUI 0x00D046
                         1 if payload.len() >= 3 => {
                             let oui = u32::from_le_bytes([payload[0], payload[1], payload[2], 0]);
                             if oui == 0x0000_D046 { info.dolby = true; }
@@ -320,20 +386,15 @@ fn parse_edid() -> Option<DisplayInfo> {
                         _ => {}
                     }
                 }
-                // Vendor-Specific Data Block (tag=3): OUI at data[0..3]
                 3 if data.len() >= 3 => {
                     let oui = u32::from_le_bytes([data[0], data[1], data[2], 0]);
                     match oui {
-                        // Dolby Vision VSDB fallback
                         0x0000_D046 => { info.dolby = true; }
-                        // HDMI Licensing VSDB [03 0C 00] = HDMI 1.x
                         0x0000_0C03 => {
                             if info.hdmi_ver.is_none() {
                                 info.hdmi_ver = Some("HDMI 1.4".into());
                             }
                         }
-                        // HDMI Forum VSDB [00 5D C4] = HDMI 2.0+
-                        // data[4] = Max TMDS Character Rate × 5 MHz; ≥600 MHz → HDMI 2.1
                         0x00C4_5D00 => {
                             let max_tmds_mhz = if data.len() >= 5 { data[4] as u32 * 5 } else { 0 };
                             info.hdmi_ver = Some(if max_tmds_mhz >= 600 {
@@ -341,7 +402,6 @@ fn parse_edid() -> Option<DisplayInfo> {
                             } else {
                                 "HDMI 2.0".into()
                             });
-                            // DSC 1.2 capable bit (byte 9 / data[8]) in HF-VSDB version ≥3
                             if data.len() >= 9 && data[8] & 0x80 != 0 { info.dsc = true; }
                         }
                         _ => {}
@@ -354,20 +414,16 @@ fn parse_edid() -> Option<DisplayInfo> {
         bs += 128;
     }
 
-    // DSC also visible via sysfs (NVIDIA driver uses this path)
     if std::path::Path::new(&format!("/sys/class/drm/{}/dsc_enable", connector_dir)).exists() {
         info.dsc = true;
     }
 
-    // DP version from DPCD byte 0
     if connector_dir.contains("-DP-") || connector_dir.contains("-eDP-") {
         if let Ok(dpcd) = std::fs::read(format!("/sys/class/drm/{}/dpcd", connector_dir)) {
             if !dpcd.is_empty() {
                 info.dp_ver = Some(match dpcd[0] {
-                    0x10 => "DP 1.0".into(),
-                    0x11 => "DP 1.1".into(),
-                    0x12 => "DP 1.2".into(),
-                    0x13 => "DP 1.3".into(),
+                    0x10 => "DP 1.0".into(), 0x11 => "DP 1.1".into(),
+                    0x12 => "DP 1.2".into(), 0x13 => "DP 1.3".into(),
                     0x14 => "DP 1.4".into(),
                     v if v >= 0x20 => "DP 2.x (UHBR)".into(),
                     v => format!("DP (DPCD {v:#04x})"),
@@ -376,11 +432,8 @@ fn parse_edid() -> Option<DisplayInfo> {
         }
     }
 
-    // HDMI-CEC: kernel CEC framework exposes /dev/cec0 when the GPU driver supports it
     info.cec = std::path::Path::new("/dev/cec0").exists();
 
-    // OLED detection: name contains "OLED" (covers LG, Samsung, Sony, Philips OLED TVs)
-    // OR sysfs panel_type (some drivers expose this: "oled", "woled", "qd-oled")
     info.is_oled = info.name.to_ascii_lowercase().contains("oled");
     if !info.is_oled {
         let panel_type_path = format!("/sys/class/drm/{}/panel_type", connector_dir);
@@ -436,6 +489,7 @@ enum Message {
     Gamut(u32),
     GamutMode(usize),
     Saturation(u32),
+    MidtoneGamma(u32),
     BitDepth(usize),
     Apply,
     Reset,
@@ -443,10 +497,8 @@ enum Message {
     ShowCalPat(CalibPattern),
     CalibrateHdr,
     CloseCalPat,
-    // OLED Care (only shown when is_oled detected)
     OledPreset(bool),
     OledDimTimeout(u32),
-    // NVIDIA gaming features
     NvSmoothMotion(bool),
     NvReflex(bool),
     NvVibrance(i32),
@@ -505,16 +557,21 @@ impl Application for CosmicHdr {
                     Message::Applied(if on { write_conf_and_apply(c).await } else { do_reset().await })
                 });
             }
-            Message::SdrNits(v)   => { self.conf.sdr_nits  = v; }
-            Message::PeakNits(v)  => { self.conf.peak_nits = v; }
-            Message::Gamut(v)     => { self.conf.gamut      = v; }
-            Message::GamutMode(i) => {
+            Message::SdrNits(v)      => { self.conf.sdr_nits      = v; }
+            Message::PeakNits(v)     => { self.conf.peak_nits     = v; }
+            Message::Gamut(v)        => { self.conf.gamut         = v; }
+            Message::GamutMode(i)    => {
                 self.conf.gamut_mode = ["bt2020", "dci-p3", "srgb"][i.min(2)].into();
             }
-            Message::Saturation(v) => { self.conf.saturation = v; }
-            Message::BitDepth(i)   => { self.conf.max_bpc = [8u32, 10, 12][i.min(2)]; }
+            Message::Saturation(v)   => { self.conf.saturation   = v; }
+            Message::MidtoneGamma(v) => { self.conf.midtone_gamma = v; }
+            Message::BitDepth(i)     => { self.conf.max_bpc = [8u32, 10, 12][i.min(2)]; }
             Message::Apply => {
-                self.status = Some("Applying…".into());
+                self.status = Some(if daemon_alive() {
+                    "Signalling daemon…".into()
+                } else {
+                    "Applying…".into()
+                });
                 let c = self.conf.clone();
                 return cosmic::task::future(async move { Message::Applied(write_conf_and_apply(c).await) });
             }
@@ -523,7 +580,13 @@ impl Application for CosmicHdr {
                 self.status = Some("Resetting…".into());
                 return cosmic::task::future(async move { Message::Applied(do_reset().await) });
             }
-            Message::Applied(Ok(())) => { self.status = Some("Applied ✓".into()); }
+            Message::Applied(Ok(())) => {
+                self.status = Some(if daemon_alive() {
+                    "Conf saved — daemon re-applying ✓".into()
+                } else {
+                    "Applied ✓".into()
+                });
+            }
             Message::Applied(Err(e)) => { self.status = Some(format!("Error: {e}")); }
             Message::ShowCalPat(pat) => {
                 if let Some(mut c) = self.cal_child.take() { let _ = c.kill(); }
@@ -553,16 +616,10 @@ impl Application for CosmicHdr {
             Message::CloseCalPat => {
                 if let Some(mut c) = self.cal_child.take() { let _ = c.kill(); }
             }
-            // NVIDIA gaming controls — update conf, no immediate apply
             Message::OledPreset(on) => {
                 self.conf.oled_preset = on;
-                if on {
-                    self.conf.sdr_nits  = 150;
-                    self.conf.peak_nits = 600;
-                } else {
-                    self.conf.sdr_nits  = 203;
-                    self.conf.peak_nits = 800;
-                }
+                if on { self.conf.sdr_nits = 150; self.conf.peak_nits = 600; }
+                else  { self.conf.sdr_nits = 203; self.conf.peak_nits = 800; }
             }
             Message::OledDimTimeout(v) => { self.conf.oled_dim_min = v; }
             Message::NvSmoothMotion(v) => { self.nvidia_conf.smooth_motion = v; }
@@ -571,9 +628,9 @@ impl Application for CosmicHdr {
             Message::NvUpscale(i)      => {
                 self.nvidia_conf.upscale = ["none", "fsr", "nis", "dlss", "integer"][i.min(4)].into();
             }
-            Message::NvDldsr(v)        => { self.nvidia_conf.dldsr          = v; }
+            Message::NvDldsr(v)           => { self.nvidia_conf.dldsr          = v; }
             Message::NvGsResolution(w, h) => { self.nvidia_conf.gs_width = w; self.nvidia_conf.gs_height = h; }
-            Message::NvGsFps(v)        => { self.nvidia_conf.gs_fps         = v; }
+            Message::NvGsFps(v)           => { self.nvidia_conf.gs_fps         = v; }
             Message::NvApply => {
                 self.status = Some("Saving NVIDIA settings…".into());
                 let nc = self.nvidia_conf.clone();
@@ -585,44 +642,34 @@ impl Application for CosmicHdr {
         Task::none()
     }
 
-    fn view(&self) -> Element<Message> {
+    fn view(&self) -> Element<'_, Message> {
         let sp = cosmic::theme::active().cosmic().spacing;
-        let mut page = column::with_capacity(14)
+        let mut page = column::with_capacity(16)
             .spacing(sp.space_m)
             .padding([sp.space_s, sp.space_l]);
 
         // ── Display capabilities ──────────────────────────────────────────────
         if let Some(ref d) = self.display {
-            // Small capability badge
             let cap = |label: &'static str, ok: bool| {
                 text::caption(if ok { format!("{label} ✓") } else { format!("{label} —") })
             };
-
-            // Row 1: HDR format support
-            let hdr_row = row::with_capacity(4)
-                .spacing(sp.space_xs)
+            let hdr_row = row::with_capacity(4).spacing(sp.space_xs)
                 .push(cap("HDR10",        d.hdr10))
                 .push(cap("HLG",          d.hlg))
                 .push(cap("HDR10+",       d.hdr10plus))
                 .push(cap("Dolby Vision", d.dolby));
-
-            // Row 2: Colour space + connection features
-            let feat_row = row::with_capacity(4)
-                .spacing(sp.space_xs)
+            let feat_row = row::with_capacity(4).spacing(sp.space_xs)
                 .push(cap("BT.2020",  d.bt2020))
                 .push(cap("DCI-P3",   d.dci_p3))
                 .push(cap("DSC",      d.dsc))
                 .push(cap("HDMI-CEC", d.cec));
+            let caps_col = column::with_capacity(2).spacing(sp.space_xxs)
+                .push(hdr_row).push(feat_row);
 
-            let caps_col = column::with_capacity(2)
-                .spacing(sp.space_xxs)
-                .push(hdr_row)
-                .push(feat_row);
-
-            // Description: interface version + EDID peak
             let iface = d.hdmi_ver.as_deref().or(d.dp_ver.as_deref()).unwrap_or("?");
             let desc = if d.max_lum_nits > 0 {
-                format!("{iface} · EDID peak {} nits", d.max_lum_nits)
+                format!("{iface} · EDID peak {} nits  ({:.1}% PQ)", d.max_lum_nits,
+                        nits_to_pq_percent(d.max_lum_nits))
             } else {
                 format!("{iface} · peak luminance not specified in EDID")
             };
@@ -638,13 +685,15 @@ impl Application for CosmicHdr {
 
         // ── GPU vendor badge ──────────────────────────────────────────────────
         let gpu_label = match self.gpu_vendor {
-            "amd"    => "AMD  ·  Full pipeline: DEGAMMA + CTM + GAMMA + saturation",
-            "intel"  => "Intel  ·  Full pipeline: DEGAMMA + CTM + GAMMA + saturation",
-            "nvidia" => "NVIDIA  ·  Gamma-only on desktop; full HDR + gaming features via hdr-game below",
+            "amd"    => "AMD  ·  Full pipeline: DEGAMMA + CTM + GAMMA + saturation + midtone",
+            "intel"  => "Intel  ·  Full pipeline: DEGAMMA + CTM + GAMMA + saturation + midtone",
+            "nvidia" => "NVIDIA  ·  Gamma-only on desktop (PQ + midtone); full HDR + gaming via hdr-game",
             _        => "GPU vendor unknown",
         };
+        let daemon_badge = if daemon_alive() { "  ·  daemon ✓ (live reload active)" } else { "" };
         page = page.push(
-            text::caption(gpu_label).apply(widget::container)
+            text::caption(format!("{gpu_label}{daemon_badge}"))
+                .apply(widget::container)
                 .padding([0, 0, sp.space_xs, 0])
         );
 
@@ -658,24 +707,26 @@ impl Application for CosmicHdr {
             ));
 
         // ── Brightness ────────────────────────────────────────────────────────
+        let sdr_pq = nits_to_pq_percent(self.conf.sdr_nits);
         let sdr_row = settings::item::builder("SDR White")
             .description("Brightness of desktop/SDR content in HDR mode")
             .control(
                 row::with_capacity(2).spacing(sp.space_s).align_y(Alignment::Center)
                     .push(widget::slider(80..=400, self.conf.sdr_nits, Message::SdrNits)
                         .width(Length::Fill))
-                    .push(text::body(format!("{} nits", self.conf.sdr_nits))
-                        .apply(widget::container).width(Length::Fixed(76.0))),
+                    .push(text::body(format!("{} nits  ({:.1}% PQ)", self.conf.sdr_nits, sdr_pq))
+                        .apply(widget::container).width(Length::Fixed(140.0))),
             );
 
+        let peak_pq = nits_to_pq_percent(self.conf.peak_nits);
         let peak_row = settings::item::builder("Display Peak")
             .description("Your display's maximum HDR luminance")
             .control(
                 row::with_capacity(2).spacing(sp.space_s).align_y(Alignment::Center)
                     .push(widget::slider(400..=1200, self.conf.peak_nits, Message::PeakNits)
                         .step(10u32).width(Length::Fill))
-                    .push(text::body(format!("{} nits", self.conf.peak_nits))
-                        .apply(widget::container).width(Length::Fixed(76.0))),
+                    .push(text::body(format!("{} nits  ({:.1}% PQ)", self.conf.peak_nits, peak_pq))
+                        .apply(widget::container).width(Length::Fixed(140.0))),
             );
 
         page = page
@@ -712,7 +763,7 @@ impl Application for CosmicHdr {
                     )),
             );
 
-        // ── Color intensity ───────────────────────────────────────────────────
+        // ── Color Intensity ───────────────────────────────────────────────────
         page = page
             .push(text::heading(if self.is_nvidia { "Color Intensity  (AMD/Intel only)" } else { "Color Intensity" }))
             .push(list_column().add(
@@ -727,7 +778,27 @@ impl Application for CosmicHdr {
                     ),
             ));
 
-        // ── Output format ─────────────────────────────────────────────────────
+        // ── Tone Mapping ──────────────────────────────────────────────────────
+        let mg_desc = match self.conf.midtone_gamma {
+            v if v > 110 => format!("{}%  — HDR punch (darkened midtones, higher contrast)", v),
+            v if v < 90  => format!("{}%  — lifted midtones (lower contrast, may look washed)", v),
+            v            => format!("{}%  — neutral", v),
+        };
+        page = page
+            .push(text::heading("Tone Mapping"))
+            .push(list_column().add(
+                settings::item::builder("Midtone Gamma")
+                    .description(mg_desc)
+                    .control(
+                        row::with_capacity(2).spacing(sp.space_s).align_y(Alignment::Center)
+                            .push(widget::slider(30..=250u32, self.conf.midtone_gamma, Message::MidtoneGamma)
+                                .step(5u32).width(Length::Fill))
+                            .push(text::body(format!("{}%", self.conf.midtone_gamma))
+                                .apply(widget::container).width(Length::Fixed(52.0))),
+                    ),
+            ));
+
+        // ── Output Format ─────────────────────────────────────────────────────
         let bpc_opts = vec![
             "8 bpc  (legacy displays)".to_string(),
             "10 bpc  (recommended — HDR10)".to_string(),
@@ -754,39 +825,28 @@ impl Application for CosmicHdr {
                 "Integer  (pixel-perfect integer scale)".to_string(),
             ];
             let upscale_sel = Some(match self.nvidia_conf.upscale.as_str() {
-                "fsr"     => 1usize,
-                "nis"     => 2,
-                "dlss"    => 3,
-                "integer" => 4,
-                _         => 0,
+                "fsr" => 1usize, "nis" => 2, "dlss" => 3, "integer" => 4, _ => 0,
             });
-
             let vibrance_pct = ((self.nvidia_conf.vibrance + 1024) as f32 / 2047.0 * 100.0) as u32;
 
             page = page
                 .push(text::heading("NVIDIA Gaming"))
                 .push(list_column()
                     .add(settings::item::builder("RTX Smooth Motion")
-                        .description("Frame generation via VK_LAYER_NV_present — works on Vulkan + DXVK/Proton")
-                        .control(toggler(self.nvidia_conf.smooth_motion)
-                            .on_toggle(Message::NvSmoothMotion)))
+                        .description("Frame generation via VK_LAYER_NV_present — Vulkan + DXVK/Proton")
+                        .control(toggler(self.nvidia_conf.smooth_motion).on_toggle(Message::NvSmoothMotion)))
                     .add(settings::item::builder("NVIDIA Reflex")
                         .description("Low-latency via NvAPI (PROTON_ENABLE_NVAPI + DXVK_ENABLE_NVAPI)")
-                        .control(toggler(self.nvidia_conf.reflex)
-                            .on_toggle(Message::NvReflex)))
+                        .control(toggler(self.nvidia_conf.reflex).on_toggle(Message::NvReflex)))
                     .add(settings::item::builder("DLDSR")
                         .description("Deep Learning Dynamic Super Resolution — renders higher, displays native")
-                        .control(toggler(self.nvidia_conf.dldsr)
-                            .on_toggle(Message::NvDldsr)))
+                        .control(toggler(self.nvidia_conf.dldsr).on_toggle(Message::NvDldsr)))
                     .add(settings::item::builder("Digital Vibrance")
                         .description("Colour saturation via nvibrant ioctl · 0% = neutral · 100% = max")
                         .control(
                             row::with_capacity(2).spacing(sp.space_s).align_y(Alignment::Center)
-                                .push(widget::slider(
-                                    -1024i32..=1023i32,
-                                    self.nvidia_conf.vibrance,
-                                    Message::NvVibrance,
-                                ).step(32i32).width(Length::Fill))
+                                .push(widget::slider(-1024i32..=1023i32, self.nvidia_conf.vibrance,
+                                    Message::NvVibrance).step(32i32).width(Length::Fill))
                                 .push(text::body(format!("{}%", vibrance_pct))
                                     .apply(widget::container).width(Length::Fixed(48.0))),
                         ))
@@ -796,13 +856,12 @@ impl Application for CosmicHdr {
                             .width(Length::Fixed(290.0))))
                 );
 
-            // Gamescope resolution / fps row
             const GS_RESOLUTIONS: &[(u32, u32, &str)] = &[
-                (1920, 1080,  "1920 × 1080  (1080p)"),
-                (2560, 1440,  "2560 × 1440  (1440p)"),
-                (3840, 2160,  "3840 × 2160  (4K UHD)"),
-                (5120, 2880,  "5120 × 2880  (5K)"),
-                (7680, 4320,  "7680 × 4320  (8K)"),
+                (1920, 1080, "1920 × 1080  (1080p)"),
+                (2560, 1440, "2560 × 1440  (1440p)"),
+                (3840, 2160, "3840 × 2160  (4K UHD)"),
+                (5120, 2880, "5120 × 2880  (5K)"),
+                (7680, 4320, "7680 × 4320  (8K)"),
             ];
             let res_opts: Vec<String> = GS_RESOLUTIONS.iter().map(|(_, _, s)| s.to_string()).collect();
             let res_sel = GS_RESOLUTIONS.iter().position(|(w, h, _)| {
@@ -822,8 +881,8 @@ impl Application for CosmicHdr {
                         .description("Gamescope framerate cap")
                         .control(
                             row::with_capacity(2).spacing(sp.space_s).align_y(Alignment::Center)
-                                .push(widget::slider(30..=360u32, self.nvidia_conf.gs_fps, Message::NvGsFps)
-                                    .step(30u32).width(Length::Fill))
+                                .push(widget::slider(30..=360u32, self.nvidia_conf.gs_fps,
+                                    Message::NvGsFps).step(30u32).width(Length::Fill))
                                 .push(text::body(format!("{} fps", self.nvidia_conf.gs_fps))
                                     .apply(widget::container).width(Length::Fixed(68.0))),
                         ))
@@ -833,7 +892,7 @@ impl Application for CosmicHdr {
                 );
         }
 
-        // ── OLED Care (only shown if display detected as OLED) ────────────────
+        // ── OLED Care ─────────────────────────────────────────────────────────
         let display_is_oled = self.display.as_ref().map(|d| d.is_oled).unwrap_or(false);
         if display_is_oled {
             let dim_label = if self.conf.oled_dim_min == 0 {
@@ -841,7 +900,6 @@ impl Application for CosmicHdr {
             } else {
                 format!("{} min", self.conf.oled_dim_min)
             };
-
             page = page
                 .push(text::heading("OLED Care"))
                 .push(list_column()
@@ -852,8 +910,8 @@ impl Application for CosmicHdr {
                         .description("Dim to 50 nits after idle timeout via swayidle · requires swayidle installed")
                         .control(
                             row::with_capacity(2).spacing(sp.space_s).align_y(Alignment::Center)
-                                .push(widget::slider(0..=60u32, self.conf.oled_dim_min, Message::OledDimTimeout)
-                                    .step(5u32).width(Length::Fill))
+                                .push(widget::slider(0..=60u32, self.conf.oled_dim_min,
+                                    Message::OledDimTimeout).step(5u32).width(Length::Fill))
                                 .push(text::body(dim_label)
                                     .apply(widget::container).width(Length::Fixed(52.0))),
                         ))
@@ -866,10 +924,9 @@ impl Application for CosmicHdr {
         // ── HDR Calibration ───────────────────────────────────────────────────
         const PATTERNS: &[CalibPattern] = &[
             CalibPattern::Black, CalibPattern::DarkGray, CalibPattern::Gray50,
-            CalibPattern::White, CalibPattern::Red, CalibPattern::Green,
+            CalibPattern::White, CalibPattern::Red,      CalibPattern::Green,
             CalibPattern::Blue,  CalibPattern::SdrHdrSplit,
         ];
-
         let mut pat_row = row::with_capacity(10).spacing(sp.space_xxs).align_y(Alignment::Center);
         for &p in PATTERNS {
             pat_row = pat_row.push(widget::button::standard(p.label()).on_press(Message::ShowCalPat(p)));
@@ -911,7 +968,7 @@ impl Application for CosmicHdr {
 
 fn main() -> cosmic::iced::Result {
     let settings = cosmic::app::Settings::default()
-        .size(cosmic::iced::Size::new(680.0, 900.0))
+        .size(cosmic::iced::Size::new(680.0, 960.0))
         .resizable(Some(8.0));
     cosmic::app::run::<CosmicHdr>(settings, ())
 }
