@@ -72,8 +72,8 @@ impl Default for NvidiaConf {
         Self {
             smooth_motion: true,
             reflex: true,
-            vibrance: 200,
-            upscale: "none".into(),
+            vibrance: 0,
+            upscale: "fsr".into(),
             dldsr: false,
             gs_width: 3840,
             gs_height: 2160,
@@ -141,14 +141,14 @@ fn read_nvidia_conf() -> NvidiaConf {
             if let Some((k, v)) = line.split_once('=') {
                 let v = v.trim();
                 match k.trim() {
-                    "SMOOTH_MOTION" => { c.smooth_motion = v == "1"; }
-                    "REFLEX"        => { c.reflex        = v == "1"; }
+                    "SMOOTH_MOTION" => { c.smooth_motion = v != "0"; }
+                    "REFLEX"        => { c.reflex        = v != "0"; }
                     "VIBRANCE"      => { if let Ok(n) = v.parse() { c.vibrance = n; } }
                     "UPSCALE"       => { c.upscale = v.to_owned(); }
-                    "DLDSR"         => { c.dldsr = v == "1"; }
-                    "GAMESCOPE_W"   => { if let Ok(n) = v.parse() { c.gs_width  = n; } }
-                    "GAMESCOPE_H"   => { if let Ok(n) = v.parse() { c.gs_height = n; } }
-                    "GAMESCOPE_R"   => { if let Ok(n) = v.parse() { c.gs_fps    = n; } }
+                    "DLDSR"         => { c.dldsr   = v == "1"; }
+                    "GS_WIDTH"      => { if let Ok(n) = v.parse() { c.gs_width  = n; } }
+                    "GS_HEIGHT"     => { if let Ok(n) = v.parse() { c.gs_height = n; } }
+                    "GS_FPS"        => { if let Ok(n) = v.parse() { c.gs_fps    = n; } }
                     _ => {}
                 }
             }
@@ -158,40 +158,39 @@ fn read_nvidia_conf() -> NvidiaConf {
 }
 
 async fn write_nvidia_conf(c: NvidiaConf) -> Result<(), String> {
-    let content = format!(
-        "# hdr-game NVIDIA configuration — managed by cosmic-hdr-panel\n\
-         SMOOTH_MOTION={}\nREFLEX={}\nVIBRANCE={}\nUPSCALE={}\nDLDSR={}\n\
-         GAMESCOPE_W={}\nGAMESCOPE_H={}\nGAMESCOPE_R={}\n",
-        c.smooth_motion as u8, c.reflex as u8, c.vibrance, c.upscale,
-        c.dldsr as u8, c.gs_width, c.gs_height, c.gs_fps,
-    );
-    // write to a temp file then pkexec tee (avoids needing write access to /etc)
-    let tmp = "/tmp/hdr-game.conf.tmp";
-    std::fs::write(tmp, &content).map_err(|e| e.to_string())?;
-    let s = Command::new("pkexec")
-        .args(["tee", "/etc/hdr-game.conf"])
-        .stdin(std::fs::File::open(tmp).map_err(|e| e.to_string())?)
-        .stdout(std::process::Stdio::null())
+    // Use pkexec kms-hdr --save-game (polkit allow_active = yes, no password prompt)
+    let status = Command::new("pkexec")
+        .args([
+            BIN, "--save-game",
+            &format!("SMOOTH_MOTION={}", c.smooth_motion as u8),
+            &format!("REFLEX={}", c.reflex as u8),
+            &format!("VIBRANCE={}", c.vibrance),
+            &format!("UPSCALE={}", c.upscale),
+            &format!("DLDSR={}", c.dldsr as u8),
+            &format!("GS_WIDTH={}", c.gs_width),
+            &format!("GS_HEIGHT={}", c.gs_height),
+            &format!("GS_FPS={}", c.gs_fps),
+        ])
         .status().await.map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(tmp);
-    // apply vibrance immediately via nvibrant if available
+    // Apply vibrance immediately via nvibrant if available
     if nvibrant_available() {
         let _ = Command::new("nvibrant").arg(c.vibrance.to_string()).status().await;
     }
-    if s.success() { Ok(()) } else { Err("failed to write /etc/hdr-game.conf".into()) }
+    if status.success() { Ok(()) } else { Err(format!("kms-hdr --save-game exited {status}")) }
 }
 
 async fn write_conf_and_apply(c: HdrConf) -> Result<(), String> {
-    let s = Command::new("pkexec")
+    let status = Command::new("pkexec")
         .args([BIN, "--save",
-               "--sdr-nits",    &c.sdr_nits.to_string(),
-               "--peak-nits",   &c.peak_nits.to_string(),
-               "--gamut",       &c.gamut.to_string(),
-               "--bpc",         &c.max_bpc.to_string(),
-               "--gamut-mode",  &c.gamut_mode,
-               "--saturation",  &c.saturation.to_string()])
+               "--sdr-nits",     &c.sdr_nits.to_string(),
+               "--peak-nits",    &c.peak_nits.to_string(),
+               "--gamut",        &c.gamut.to_string(),
+               "--bpc",          &c.max_bpc.to_string(),
+               "--gamut-mode",   &c.gamut_mode,
+               "--saturation",   &c.saturation.to_string(),
+               "--oled-dim-min", &c.oled_dim_min.to_string()])
         .status().await.map_err(|e| e.to_string())?;
-    if !s.success() { return Err(format!("kms-hdr exited {s}")); }
+    if !status.success() { return Err(format!("kms-hdr exited {status}")); }
     setup_oled_dim(c.oled_dim_min).await;
     Ok(())
 }
