@@ -39,11 +39,12 @@ struct HdrConf {
     gamut: u32,
     max_bpc: u32,
     gamut_mode: String,
+    saturation: u32,
 }
 
 impl Default for HdrConf {
     fn default() -> Self {
-        Self { sdr_nits: 203, peak_nits: 800, gamut: 100, max_bpc: 10, gamut_mode: "bt2020".into() }
+        Self { sdr_nits: 203, peak_nits: 800, gamut: 100, max_bpc: 10, gamut_mode: "bt2020".into(), saturation: 100 }
     }
 }
 
@@ -57,7 +58,8 @@ fn read_conf() -> HdrConf {
                     "PEAK_NITS"  => { if let Ok(n) = v.trim().parse() { c.peak_nits  = n; } }
                     "GAMUT"      => { if let Ok(n) = v.trim().parse() { c.gamut      = n; } }
                     "MAX_BPC"    => { if let Ok(n) = v.trim().parse() { c.max_bpc    = n; } }
-                    "GAMUT_MODE" => { c.gamut_mode = v.trim().to_owned(); }
+                    "GAMUT_MODE"  => { c.gamut_mode = v.trim().to_owned(); }
+                    "SATURATION"  => { if let Ok(n) = v.trim().parse() { c.saturation = n; } }
                     _ => {}
                 }
             }
@@ -73,7 +75,8 @@ async fn write_conf_and_apply(c: HdrConf) -> Result<(), String> {
                "--peak-nits",  &c.peak_nits.to_string(),
                "--gamut",      &c.gamut.to_string(),
                "--bpc",        &c.max_bpc.to_string(),
-               "--gamut-mode", &c.gamut_mode])
+               "--gamut-mode", &c.gamut_mode,
+               "--saturation", &c.saturation.to_string()])
         .status().await.map_err(|e| e.to_string())?;
     if s.success() { Ok(()) } else { Err(format!("cosmic-hdr exited {s}")) }
 }
@@ -280,6 +283,7 @@ enum Message {
     PeakNits(u32),
     Gamut(u32),
     GamutMode(usize),
+    Saturation(u32),
     BitDepth(usize),
     Apply,
     Reset,
@@ -335,7 +339,8 @@ impl Application for CosmicHdr {
             Message::GamutMode(i) => {
                 self.conf.gamut_mode = ["bt2020", "dci-p3", "srgb"][i.min(2)].into();
             }
-            Message::BitDepth(i)  => { self.conf.max_bpc = [8u32, 10, 12][i.min(2)]; }
+            Message::Saturation(v) => { self.conf.saturation = v; }
+            Message::BitDepth(i)   => { self.conf.max_bpc = [8u32, 10, 12][i.min(2)]; }
             Message::Apply => {
                 self.status = Some("Applying…".into());
                 let c = self.conf.clone();
@@ -494,6 +499,21 @@ impl Application for CosmicHdr {
                                 .apply(widget::container).width(Length::Fixed(48.0))),
                     )),
             );
+
+        // ── Color intensity ───────────────────────────────────────────────────
+        page = page
+            .push(text::heading("Color Intensity"))
+            .push(list_column().add(
+                settings::item::builder("Saturation")
+                    .description("Color vividness via BT.709 saturation matrix · 100% = neutral · 150% = vivid")
+                    .control(
+                        row::with_capacity(2).spacing(sp.space_s).align_y(Alignment::Center)
+                            .push(widget::slider(50..=200u32, self.conf.saturation, Message::Saturation)
+                                .step(5u32).width(Length::Fill))
+                            .push(text::body(format!("{}%", self.conf.saturation))
+                                .apply(widget::container).width(Length::Fixed(52.0))),
+                    ),
+            ));
 
         // ── Output format ─────────────────────────────────────────────────────
         let bpc_opts = vec![
